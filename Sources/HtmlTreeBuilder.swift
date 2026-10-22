@@ -11,6 +11,8 @@ import Foundation
  * HTML Tree Builder; creates a DOM from Tokens.
  */
 class HtmlTreeBuilder: TreeBuilder {
+    static let templateTagName = Array("template".utf8)
+
     enum PendingTableCharacter {
         case slice(ByteSlice)
         case bytes([UInt8])
@@ -19,10 +21,10 @@ class HtmlTreeBuilder: TreeBuilder {
     
     private enum TagSets {
         // tag searches
-        static let inScope = ParsingStrings(["applet", "caption", "html", "table", "td", "th", "marquee", "object"])
+        static let inScope = ParsingStrings(["applet", "caption", "html", "table", "td", "th", "marquee", "object", "template"])
         static let list = ParsingStrings(["ol", "ul"])
         static let button = ParsingStrings(["button"])
-        static let tableScope = ParsingStrings(["html", "table"])
+        static let tableScope = ParsingStrings(["html", "table", "template"])
         static let selectScope = ParsingStrings(["optgroup", "option"])
         static let endTags = ParsingStrings(["dd", "dt", "li", "option", "optgroup", "p", "rp", "rt"])
         static let titleTextarea = ParsingStrings(["title", "textarea"])
@@ -35,13 +37,13 @@ class HtmlTreeBuilder: TreeBuilder {
                                              "iframe", "img", "input", "isindex", "li", "link", "listing", "marquee", "menu", "meta", "nav",
                                              "noembed", "noframes", "noscript", "object", "ol", "p", "param", "plaintext", "pre", "script",
                                              "section", "select", "style", "summary", "table", "tbody", "td", "textarea", "tfoot", "th", "thead",
-                                             "title", "tr", "ul", "wbr", "xmp"])
+                                             "title", "tr", "ul", "wbr", "xmp", "template"])
     }
     
     private enum StackContexts {
-        static let table = ParsingStrings(["table"])
-        static let tableBody = ParsingStrings(["tbody", "tfoot", "thead"])
-        static let tableRow = ParsingStrings(["tr"])
+        static let table = ParsingStrings(["table", "template"])
+        static let tableBody = ParsingStrings(["tbody", "tfoot", "thead", "template"])
+        static let tableRow = ParsingStrings(["tr", "template"])
     }
     
     private var _state: HtmlTreeBuilderState = HtmlTreeBuilderState.Initial // the current state
@@ -58,6 +60,9 @@ class HtmlTreeBuilder: TreeBuilder {
     private var _framesetOk: Bool = true // if ok to go into frameset
     private var fosterInserts: Bool = false // if next inserts should be fostered
     private var fragmentParsing: Bool = false // if parsing a fragment of html
+    // Nested templates retain their own content insertion mode. The native
+    // DOM continues storing contents as children, preserving serialization.
+    private var templateInsertionModes: [HtmlTreeBuilderState] = []
 
     private var stackTrackingDirty: Bool = false
     private var stackUnknownTagIdCount: Int = 0
@@ -83,6 +88,13 @@ class HtmlTreeBuilder: TreeBuilder {
     override func initialiseParse(_ input: [UInt8], _ baseUri: [UInt8], _ errors: ParseErrorList, _ settings: ParseSettings) {
         super.initialiseParse(input, baseUri, errors, settings)
         resetStackTracking()
+        templateInsertionModes.removeAll(keepingCapacity: true)
+    }
+
+    override func initialiseParse(_ input: UnsafeBufferPointer<UInt8>, owner: AnyObject?, _ baseUri: [UInt8], _ errors: ParseErrorList, _ settings: ParseSettings) {
+        super.initialiseParse(input, owner: owner, baseUri, errors, settings)
+        resetStackTracking()
+        templateInsertionModes.removeAll(keepingCapacity: true)
     }
 
     func parseFragment(_ inputFragment: [UInt8], _ context: Element?, _ baseUri: [UInt8], _ errors: ParseErrorList, _ settings: ParseSettings) throws -> Array<Node> {
@@ -119,6 +131,7 @@ class HtmlTreeBuilder: TreeBuilder {
             try Validate.notNull(obj: root)
             try doc.appendChild(root!)
             push(root!)
+            if context.tagNameNormal() == "template" { pushTemplateMode(.InTemplate) }
             resetInsertionMode()
             
             // setup form element to nearest form on context (up ancestor chain). ensures form controls are associated
@@ -204,6 +217,37 @@ class HtmlTreeBuilder: TreeBuilder {
         (node ?? currentElement())?.markSourceDirty(force: true)
     }
     
+    func pushTemplateMode(_ mode: HtmlTreeBuilderState) {
+        templateInsertionModes.append(mode)
+    }
+
+    func currentTemplateMode() -> HtmlTreeBuilderState? {
+        templateInsertionModes.last
+    }
+
+    func replaceTemplateMode(_ mode: HtmlTreeBuilderState) {
+        if !templateInsertionModes.isEmpty { templateInsertionModes.removeLast() }
+        templateInsertionModes.append(mode)
+    }
+
+    @discardableResult
+    func closeTemplate() -> Bool {
+        guard getFromStack(Self.templateTagName) != nil else { return false }
+        // Thorough implied end tags are specific to template closure. Leave
+        // optional-end-tag behavior for unrelated content unchanged.
+        while let current = currentElement(),
+              ["caption", "colgroup", "dd", "dt", "li", "optgroup", "option",
+               "p", "rb", "rp", "rt", "rtc", "tbody", "td", "tfoot", "th",
+               "thead", "tr"].contains(current.tagNameNormal()) {
+            pop()
+        }
+        popStackToClose(Self.templateTagName)
+        clearFormattingElementsToLastMarker()
+        if !templateInsertionModes.isEmpty { templateInsertionModes.removeLast() }
+        resetInsertionMode()
+        return true
+    }
+
     func state() -> HtmlTreeBuilderState {
         return _state
     }
@@ -235,7 +279,7 @@ class HtmlTreeBuilder: TreeBuilder {
     }
     
     func maybeSetBaseUri(_ base: Element) throws {
-        if (baseUriSetFromDoc) { // only listen to the first <base href> in parse
+        if baseUriSetFromDoc || currentTemplateMode() != nil { // inert bases cannot change the document
             return
         }
         
@@ -389,7 +433,7 @@ class HtmlTreeBuilder: TreeBuilder {
         } else {
             el = FormElement(tag, baseUri, skipChildReserve: isBulkBuilding)
         }
-        setFormElement(el)
+        if currentTemplateMode() == nil { setFormElement(el) }
         if let range = startTag.sourceRange {
             el.setSourceRange(range, complete: false)
         }
@@ -544,8 +588,10 @@ class HtmlTreeBuilder: TreeBuilder {
             current.childNodes.append(node)
             node.parentNode = current
             node.setSiblingIndex(current.childNodes.count - 1)
+        } else if fosterInserts {
+            try insertInFosterParent(node)
         } else {
-            try current?.appendChild(node) // doesn't use insertNode, because we don't foster these; and will always have a stack.
+            try current?.appendChild(node)
         }
     }
 
@@ -573,7 +619,17 @@ class HtmlTreeBuilder: TreeBuilder {
         
         // connect form controls to their form element
         if let n = (node as? Element), n.tag().isFormListed() {
-            formElement?.addElement(n)
+            var owner = formElement
+            if currentTemplateMode() != nil {
+                owner = nil
+                // Template controls cannot belong to the document's form
+                // pointer. Associate only with a form in this template tree.
+                for ancestor in stack.reversed() {
+                    if ancestor.nodeNameUTF8() == Self.templateTagName { break }
+                    if let form = ancestor as? FormElement { owner = form; break }
+                }
+            }
+            owner?.addElement(n)
         }
     }
     
@@ -970,7 +1026,7 @@ class HtmlTreeBuilder: TreeBuilder {
             if (pos == 0) {
                 last = true
                 //Validate node
-                node = contextElement!
+                if let contextElement { node = contextElement }
             }
             let name: String = String(decoding: node.nodeNameUTF8(), as: UTF8.self)
             if ("select".equals(name)) {
@@ -994,8 +1050,11 @@ class HtmlTreeBuilder: TreeBuilder {
             } else if ("table".equals(name)) {
                 transition(HtmlTreeBuilderState.InTable)
                 break
-            } else if ("head".equals(name)) {
-                transition(HtmlTreeBuilderState.InBody)
+            } else if "template".equals(name), let mode = currentTemplateMode() {
+                transition(mode)
+                break
+            } else if "head".equals(name) && !last {
+                transition(HtmlTreeBuilderState.InHead)
                 break // frag
             } else if ("body".equals(name)) {
                 transition(HtmlTreeBuilderState.InBody)
@@ -1004,7 +1063,7 @@ class HtmlTreeBuilder: TreeBuilder {
                 transition(HtmlTreeBuilderState.InFrameset)
                 break // frag
             } else if ("html".equals(name)) {
-                transition(HtmlTreeBuilderState.BeforeHead)
+                transition(headElement == nil ? .BeforeHead : .AfterHead)
                 break // frag
             } else if (last) {
                 transition(HtmlTreeBuilderState.InBody)
@@ -1423,6 +1482,15 @@ class HtmlTreeBuilder: TreeBuilder {
     }
     
     func insertInFosterParent(_ input: Node) throws {
+        // The original table slice includes nodes now being relocated. It
+        // cannot be replayed by source-preserving serialization afterward.
+        markStructuralChange()
+        // Table recovery cannot move template contents before an outer table.
+        if let templateIndex = lastIndexOfStackName(Self.templateTagName),
+           templateIndex > (lastIndexOfStackName(UTF8Arrays.table) ?? -1) {
+            try stack[templateIndex].appendChild(input)
+            return
+        }
         let fosterParent: Element?
         let lastTable: Element? = getFromStack(UTF8Arrays.table)
         var isLastTableParent: Bool = false
