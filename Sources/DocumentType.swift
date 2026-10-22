@@ -116,17 +116,28 @@ public class DocumentType: Node {
 
         if (has(DocumentType.PUBLIC_ID)) {
             if let slice = attributes?.valueSliceCaseSensitive(DocumentType.PUBLIC_ID), !slice.isEmpty {
-                accum.append(" \"").append(slice).append("\"")
+                appendQuotedIdentifier(slice, to: accum)
             }
 
         }
         if (has(DocumentType.SYSTEM_ID)) {
             if let slice = attributes?.valueSliceCaseSensitive(DocumentType.SYSTEM_ID), !slice.isEmpty {
-                accum.append(" \"").append(slice).append("\"")
+                appendQuotedIdentifier(slice, to: accum)
             }
 
         }
         accum.append(">")
+    }
+
+    private func appendQuotedIdentifier(_ identifier: ByteSlice, to accum: StringBuilder) {
+        // Parsed single-quoted identifiers may contain a literal double quote.
+        // Entity escaping would change their value: DOCTYPE identifiers do not
+        // decode character references. Choose a delimiter absent from the value.
+        // Manually constructed values containing both delimiters retain the
+        // existing double-quoted fallback; neither delimiter can encode them.
+        let quote = identifier.contains(UInt8(ascii: "\""))
+            && !identifier.contains(UInt8(ascii: "'")) ? "'" : "\""
+        accum.append(" ").append(quote).append(identifier).append(quote)
     }
 
     override func outerHtmlTail(_ accum: StringBuilder, _ depth: Int, _ out: OutputSettings) {
