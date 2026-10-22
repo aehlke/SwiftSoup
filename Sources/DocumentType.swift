@@ -135,7 +135,14 @@ public class DocumentType: Node {
     private func has(_ attribute: [UInt8]) -> Bool {
         guard let attributes else { return false }
         do {
-            return !(try attributes.getIgnoreCaseSlice(key: attribute).trim().isEmpty)
+            // Whitespace inside a quoted public/system identifier is data.
+            // Omitting a whitespace-only value can leave a bare PUBLIC or
+            // SYSTEM keyword, changing the browser's document mode on reparse.
+            let value = try attributes.getIgnoreCaseSlice(key: attribute)
+            if attribute == DocumentType.PUBLIC_ID || attribute == DocumentType.SYSTEM_ID {
+                return !value.isEmpty
+            }
+            return !value.trim().isEmpty
         } catch {
             return false
         }
